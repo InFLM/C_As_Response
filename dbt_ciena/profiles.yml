@@ -1,0 +1,17 @@
+ciena_matillion_replacement:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      # Key-pair auth. The runner (run_ciena_as_response.py) decodes your base64
+      # SNOWFLAKE_PRIVATE_KEY into raw PEM and exposes it as SNOWFLAKE_PRIVATE_KEY_PEM
+      # for the dbt subprocess, which is the format dbt-snowflake's private_key expects.
+      private_key: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PEM') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'CIENA') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'DATA_IMPORT_LARGE') }}"
+      schema: "{{ env_var('SNOWFLAKE_SCHEMA', 'PCC') }}"
+      threads: 4
+      client_session_keep_alive: false

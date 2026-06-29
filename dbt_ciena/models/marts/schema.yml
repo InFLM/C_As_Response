@@ -1,0 +1,13 @@
+version: 2
+
+models:
+  - name: fct_as_response
+    description: "Incremental replacement for the Matillion AS_Response Combine_Ciena rewrite-table flow."
+    columns:
+      - name: assess_response_id
+        data_tests:
+          - not_null
+          - unique
+      - name: revision_date
+        data_tests:
+          - not_null

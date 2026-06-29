@@ -1,0 +1,17 @@
+name: ciena_matillion_replacement
+version: '1.0.0'
+config-version: 2
+
+profile: ciena_matillion_replacement
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+models:
+  ciena_matillion_replacement:
+    staging:
+      +materialized: view
+      +schema: PCC
+    marts:
+      +materialized: incremental
+      +schema: PCC
