@@ -11,7 +11,10 @@ models:
   ciena_matillion_replacement:
     staging:
       +materialized: view
-      +schema: PCC
     marts:
       +materialized: incremental
-      +schema: PCC
+
+quoting:
+  database: false
+  schema: false
+  identifier: true

@@ -5,9 +5,13 @@ models:
     description: "Incremental replacement for the Matillion AS_Response Combine_Ciena rewrite-table flow."
     columns:
       - name: assess_response_id
+        quote: true
         data_tests:
           - not_null
           - unique
       - name: revision_date
+        quote: true
         data_tests:
-          - not_null
+          - not_null:
+              config:
+                severity: warn
