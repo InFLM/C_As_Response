@@ -3,9 +3,11 @@ version: 2
 sources:
   - name: ciena_pcc_raw
     database: CIENA
-    schema: PCC
+    schema: "{{ env_var('SNOWFLAKE_SCHEMA') }}"
+    quoting:
+      identifier: true
     tables:
-      - name: RAW_AS_RESPONSE_C
-        description: "Python-loaded replacement for Matillion as_response_c incremental extract."
+      - name: as_response_c
+        description: "Prod landing table (Matillion as_response_c), replace-loaded each run."
       - name: as_response
-        description: "Current production final table from existing pipeline; useful while validating migration."
+        description: "Prod final table, for validation."
