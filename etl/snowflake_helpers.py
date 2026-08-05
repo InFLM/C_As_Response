@@ -115,8 +115,13 @@ def load_parquet_folder_to_table(
                 cur.execute(create_table_sql)
 
             cur.execute(f"CREATE STAGE IF NOT EXISTS {stage_name}")
+            # USE_LOGICAL_TYPE = TRUE makes Snowflake honor Parquet's timestamp logical type.
+            # Without it, pandas/pyarrow nanosecond timestamps (revision_date, created_date)
+            # load as raw int64 nanoseconds instead of TIMESTAMPs. CREATE OR REPLACE (not
+            # IF NOT EXISTS) so the setting actually applies to an already-existing format.
             cur.execute(
-                f"CREATE FILE FORMAT IF NOT EXISTS {file_format_name} TYPE = PARQUET"
+                f"CREATE OR REPLACE FILE FORMAT {file_format_name} "
+                "TYPE = PARQUET USE_LOGICAL_TYPE = TRUE"
             )
             cur.execute(f"REMOVE @{stage_name}")
 

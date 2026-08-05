@@ -22,7 +22,11 @@ from dotenv import load_dotenv
 import socket
 import traceback
 
-from etl.sqlserver_helpers import extract_query_to_parquet, get_window_start
+from etl.sqlserver_helpers import (
+    extract_chunked_to_parquet,
+    get_key_bounds,
+    get_window_start,
+)
 from etl.snowflake_helpers import load_parquet_folder_to_table
 from etl.notify import send_notification
 
@@ -79,6 +83,35 @@ def build_query(window_start: str) -> str:
         CONVERT(varchar(33), revision_date_utc_offset, 127) AS [revision_date_utc_offset]
     FROM dbo.as_response WITH (NOLOCK)
     WHERE CAST(revision_date AS date) >= '{window_start}'
+    OPTION (RECOMPILE)
+    """
+
+
+def build_chunk_query(assess_id_lo: int, assess_id_hi: int, window_start: str) -> str:
+    """One chunk of the extract: the revision_date window restricted to a half-open
+    assess_id range [lo, hi).
+
+    assess_id is the leading column of the table's CLUSTERED index, so
+    `assess_id >= lo AND assess_id < hi` is a bounded clustered range scan -- a small slice
+    of the table instead of one giant full scan that a log restore can kill. The
+    revision_date predicate matches build_query exactly.
+    """
+    return f"""
+    SELECT
+        assess_response_id,
+        assess_id,
+        question_key,
+        item_value,
+        acknowledged,
+        created_date,
+        position_desc,
+        revision_date,
+        revision_by,
+        long_username,
+        CONVERT(varchar(33), revision_date_utc_offset, 127) AS [revision_date_utc_offset]
+    FROM dbo.as_response WITH (NOLOCK)
+    WHERE assess_id >= {assess_id_lo} AND assess_id < {assess_id_hi}
+      AND CAST(revision_date AS date) >= '{window_start}'
     OPTION (RECOMPILE)
     """
 
@@ -145,16 +178,26 @@ def main() -> str:
     # tools when reconciling them against one fixed window).
     window_start = os.getenv("WINDOW_START_DATE") or get_window_start(lookback_days)
 
-    # No index on revision_date means the date filter scans all ~2.4B rows. We do this in
-    # a single streaming pass and write each chunk to its own Parquet file as it arrives.
+    # No index on revision_date means the date filter scans all ~2.4B rows -- one long,
+    # uninterruptible pass that the log-shipping standby kills whenever it restores a log.
+    # The table IS clustered on assess_id, so we walk that key in resumable ranges: each chunk
+    # is a bounded range scan that fits between restores and is retried on its own if dropped.
+    # Tune the chunk count with EXTRACT_CHUNKS; resume an aborted run with EXTRACT_RUN_ID.
+    n_chunks = int(os.getenv("EXTRACT_CHUNKS", "300"))
+    key_lo, key_hi = get_key_bounds("assess_id", "dbo.as_response")
+
     print(
         f"Extracting dbo.as_response for cast(revision_date as date) >= {window_start} "
-        f"(server-derived {lookback_days}-day window, matches Matillion) -> {output_folder}"
+        f"(server-derived {lookback_days}-day window) across assess_id [{key_lo}, {key_hi}] "
+        f"in ~{n_chunks} chunk(s) -> {output_folder}"
     )
 
-    rows = extract_query_to_parquet(
-        query=build_query(window_start),
+    rows = extract_chunked_to_parquet(
+        build_chunk_query=lambda lo, hi: build_chunk_query(lo, hi, window_start),
         output_path=str(output_folder),
+        key_lo=key_lo,
+        key_hi=key_hi,
+        n_chunks=n_chunks,
         chunksize=100_000,   # fewer round-trips over the fragile link than 5,000
         max_retries=5,
     )

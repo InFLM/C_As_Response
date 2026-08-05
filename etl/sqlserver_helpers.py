@@ -1,3 +1,6 @@
+import glob
+import json
+import math
 import os
 import shutil
 import urllib.parse
@@ -137,7 +140,9 @@ def extract_query_to_parquet(
                     )
             return total_rows
 
-        except (pyodbc.OperationalError, pyodbc.Error) as exc:
+        # pd.read_sql wraps pyodbc failures in pandas.errors.DatabaseError, so catch BOTH --
+        # otherwise a mid-query drop (SQLExecDirectW/SQLFetch) escapes the retry entirely.
+        except (pyodbc.Error, pd.errors.DatabaseError) as exc:
             if attempt >= max_retries:
                 logger.error("Extract failed after %s attempt(s): %s", attempt, exc)
                 raise
@@ -150,3 +155,123 @@ def extract_query_to_parquet(
                 wait,
             )
             time.sleep(wait)
+
+
+def get_key_bounds(key_col: str, table: str) -> tuple[int, int]:
+    """Return (min, max) of an indexed key column -- cheaply.
+
+    dbo.as_response is clustered on (assess_id, question_key), so MIN/MAX of assess_id is
+    satisfied from the first/last pages of the clustered index (an index seek), NOT a full
+    scan. Used only to compute chunk boundaries; the revision_date filtering happens per chunk.
+    """
+    sql = f"SELECT MIN({key_col}) AS lo, MAX({key_col}) AS hi FROM {table} WITH (NOLOCK)"
+    with connect_sqlserver() as conn:
+        cur = conn.cursor()
+        cur.execute(sql)
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        raise ValueError(f"No rows / NULL bounds for {key_col} in {table}")
+    return int(row[0]), int(row[1])
+
+
+def extract_chunked_to_parquet(
+    build_chunk_query,
+    output_path: str,
+    key_lo: int,
+    key_hi: int,
+    n_chunks: int = 300,
+    chunksize: int = 100_000,
+    max_retries: int = 5,
+    retry_backoff_seconds: float = 10.0,
+    resume: bool = True,
+) -> int:
+    """Extract a revision_date window in resumable chunks along the clustered assess_id key.
+
+    Why (vs. single-pass extract_query_to_parquet): the source is a log-shipping standby that
+    drops every session each time it restores a log, so one long full scan reliably gets
+    killed mid-read. The table IS clustered on assess_id, so each chunk
+    (WHERE assess_id >= lo AND assess_id < hi AND <revision_date filter>) is a bounded range
+    scan that finishes between restores. A dropped chunk is retried on its own -- catching
+    both pyodbc errors AND the pandas.errors.DatabaseError that pd.read_sql wraps them in --
+    and progress is checkpointed to <output_path>/_manifest.json, so an aborted run resumes
+    (re-run with EXTRACT_RUN_ID set to the same run_id). Tune piece size with n_chunks.
+
+    build_chunk_query: callable(lo, hi) -> SQL for the half-open [lo, hi) assess_id range.
+    """
+    os.makedirs(output_path, exist_ok=True)
+    manifest_path = os.path.join(output_path, "_manifest.json")
+
+    completed: dict[str, int] = {}
+    total_rows = 0
+    if resume and os.path.exists(manifest_path):
+        with open(manifest_path) as fh:
+            state = json.load(fh)
+        completed = state.get("completed", {})
+        total_rows = state.get("total_rows", 0)
+        logger.info(
+            "Resuming: %s chunk(s) done, %s rows so far.", len(completed), f"{total_rows:,}"
+        )
+    else:
+        for f in glob.glob(os.path.join(output_path, "*.parquet")):
+            os.remove(f)
+
+    step = max(1, math.ceil((key_hi - key_lo + 1) / max(1, n_chunks)))
+    ranges = []
+    start = key_lo
+    while start <= key_hi:
+        ranges.append((start, start + step))   # half-open; final end may overshoot (ok)
+        start += step
+    logger.info(
+        "Extracting in %s chunk(s) of ~%s assess_id-units over [%s, %s].",
+        len(ranges), f"{step:,}", key_lo, key_hi,
+    )
+
+    def _save_manifest() -> None:
+        tmp = manifest_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"completed": completed, "total_rows": total_rows}, fh)
+        os.replace(tmp, manifest_path)   # atomic: a crash can't corrupt the manifest
+
+    for idx, (clo, chi) in enumerate(ranges, start=1):
+        key = f"{clo}-{chi}"
+        if key in completed:
+            continue
+        attempt = 0
+        while True:
+            attempt += 1
+            # Clear partial files from a previous failed attempt of THIS chunk only.
+            for f in glob.glob(os.path.join(output_path, f"part-{clo}-{chi}-*.parquet")):
+                os.remove(f)
+            try:
+                rows_this = 0
+                with connect_sqlserver() as conn:
+                    for j, chunk in enumerate(
+                        pd.read_sql(build_chunk_query(clo, chi), conn, chunksize=chunksize),
+                        start=1,
+                    ):
+                        fp = os.path.join(output_path, f"part-{clo}-{chi}-{j:03d}.parquet")
+                        chunk.to_parquet(fp, index=False, engine="pyarrow")
+                        rows_this += len(chunk)
+                completed[key] = rows_this
+                total_rows += rows_this
+                _save_manifest()
+                logger.info(
+                    "chunk %s/%s assess_id [%s, %s): %s rows (running total %s)",
+                    idx, len(ranges), clo, chi, f"{rows_this:,}", f"{total_rows:,}",
+                )
+                break
+            except (pyodbc.Error, pd.errors.DatabaseError) as exc:
+                if attempt >= max_retries:
+                    logger.error(
+                        "Chunk assess_id [%s, %s) failed after %s attempt(s): %s",
+                        clo, chi, attempt, exc,
+                    )
+                    raise
+                wait = retry_backoff_seconds * attempt
+                logger.warning(
+                    "chunk [%s, %s) dropped on attempt %s/%s (%s). Retrying in %.0fs...",
+                    clo, chi, attempt, max_retries, exc, wait,
+                )
+                time.sleep(wait)
+
+    return total_rows
