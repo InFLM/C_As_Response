@@ -148,6 +148,91 @@ def load_parquet_folder_to_table(
             cur.close()
 
 
+def prepare_raw_table(
+    target_table: str,
+    create_table_sql: str | None = None,
+    truncate: bool = False,
+    stage_name: str = "PY_ETL_STAGE",
+    file_format_name: str = "PY_PARQUET_FORMAT",
+) -> None:
+    """Prepare the raw landing table/stage/file-format ONCE per run for streaming loads.
+
+    Used by the chunk-streaming extractor: the target is set up a single time, then each
+    extracted chunk is appended via load_parquet_files_append() and its local Parquet is
+    deleted -- so the VM never holds more than ~one chunk of Parquet on disk at a time.
+
+    truncate:
+        TRUNCATE the target so the run holds exactly this window. Pass True ONLY on a fresh
+        run -- a RESUMED run (EXTRACT_RUN_ID) must keep the chunks already loaded. TRUNCATE
+        also clears Snowflake's per-file load metadata, so after a fresh truncate every chunk
+        COPYs cleanly; within a run we never truncate again, which is what makes a re-COPY of
+        an already-loaded chunk (after a crash/resume) a safe no-op.
+    create_table_sql:
+        Optional `CREATE TABLE IF NOT EXISTS ...` to bootstrap the target on first run.
+    """
+    with connect_snowflake() as conn:
+        cur = conn.cursor()
+        try:
+            if create_table_sql:
+                cur.execute(create_table_sql)
+            cur.execute(f"CREATE STAGE IF NOT EXISTS {stage_name}")
+            # USE_LOGICAL_TYPE = TRUE: honor Parquet timestamp logical types (else nanosecond
+            # int64). CREATE OR REPLACE so the setting applies even to a pre-existing format.
+            cur.execute(
+                f"CREATE OR REPLACE FILE FORMAT {file_format_name} "
+                "TYPE = PARQUET USE_LOGICAL_TYPE = TRUE"
+            )
+            # Clear any files left staged by a prior crashed run.
+            cur.execute(f"REMOVE @{stage_name}")
+            if truncate:
+                cur.execute(f"TRUNCATE TABLE IF EXISTS {target_table}")
+        finally:
+            cur.close()
+
+
+def load_parquet_files_append(
+    files,
+    target_table: str,
+    stage_name: str = "PY_ETL_STAGE",
+    file_format_name: str = "PY_PARQUET_FORMAT",
+) -> None:
+    """Append a specific set of local Parquet files to an already-prepared table.
+
+    The streaming extractor calls this once per chunk (then deletes the local files), so the
+    VM disk never holds more than one chunk. Requires prepare_raw_table() to have created the
+    stage/format and, on a fresh run, truncated the target.
+
+    Idempotent on resume: each chunk's files have unique names and we do NOT truncate here, so
+    if a chunk's COPY succeeded but the run crashed before the chunk was marked complete, the
+    re-COPY on resume is skipped by Snowflake's load metadata -- no duplicate rows. We stage
+    only this chunk's files and REMOVE them right after COPY, so the stage stays tiny too.
+    """
+    file_paths = [Path(f) for f in files]
+    if not file_paths:
+        return
+    with connect_snowflake() as conn:
+        cur = conn.cursor()
+        try:
+            for file in file_paths:
+                cur.execute(
+                    f"PUT 'file://{file.resolve()}' @{stage_name} "
+                    "AUTO_COMPRESS = FALSE OVERWRITE = TRUE"
+                )
+            cur.execute(
+                f"""
+                COPY INTO {target_table}
+                FROM @{stage_name}
+                FILE_FORMAT = (FORMAT_NAME = {file_format_name})
+                MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+                PURGE = FALSE
+                """
+            )
+            # Keep the stage small: drop this chunk's files before the next chunk stages its.
+            cur.execute(f"REMOVE @{stage_name}")
+        finally:
+            cur.close()
+
+
 #---------------------------------------------
 
 # import os

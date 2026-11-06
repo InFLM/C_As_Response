@@ -15,10 +15,10 @@ select
     "revision_date_utc_offset"
 from {{ source('ciena_pcc_raw', 'as_response_c') }}
 
--- Belt-and-suspenders: guarantee one row per assess_response_id (latest revision wins)
--- so the downstream incremental MERGE can never hit a nondeterministic-merge error,
--- even if the raw table somehow contains duplicates.
+-- Collapse to ONE row per natural key (assess_id, question_key), latest revision wins, to
+-- match the source's unique constraint and feed the natural-key MERGE. `nulls last` so a
+-- NULL revision_date never beats a real one (Snowflake orders NULLs FIRST on DESC by default).
 qualify row_number() over (
-    partition by "assess_response_id"
-    order by "revision_date" desc
+    partition by "assess_id", "question_key"
+    order by "revision_date" desc nulls last
 ) = 1

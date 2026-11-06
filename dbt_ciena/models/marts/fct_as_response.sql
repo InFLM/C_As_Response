@@ -1,10 +1,18 @@
 {{ config(
     materialized='incremental',
-    unique_key='"assess_response_id"',
+    unique_key=['"assess_id"', '"question_key"'],
     incremental_strategy='merge',
-    on_schema_change='sync_all_columns',
+    on_schema_change='append_new_columns',
     alias='as_response'
 ) }}
+
+-- MERGE grain: the source is UNIQUE on (assess_id, question_key), and PCC assigns a NEW
+-- assess_response_id when a response is revised. Keying the merge on assess_response_id
+-- therefore leaves the OLD row behind on every revision -> duplicate rows per
+-- (assess_id, question_key). We upsert on the natural key so a revision UPDATES the existing
+-- row in place (and its assess_response_id changes to the new one), matching the source.
+-- on_schema_change is 'append_new_columns' (not sync_all_columns) so a schema drift can never
+-- silently DROP a column from the prod table.
 
 -- Bare (unquoted) identifiers: must match the unique_key ('assess_response_id') so the
 -- incremental MERGE join resolves correctly. Do NOT double-quote these.

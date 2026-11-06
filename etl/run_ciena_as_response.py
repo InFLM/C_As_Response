@@ -27,8 +27,9 @@ from etl.sqlserver_helpers import (
     get_key_bounds,
     get_window_start,
 )
-from etl.snowflake_helpers import load_parquet_folder_to_table
+from etl.snowflake_helpers import prepare_raw_table, load_parquet_files_append
 from etl.notify import send_notification
+from etl.reconcile import reconcile_run
 
 # Repo layout: this file is at <repo>/etl/run_ciena_as_response.py
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -145,11 +146,15 @@ def run_dbt() -> None:
     if b64_key and not env.get("SNOWFLAKE_PRIVATE_KEY_PEM"):
         env["SNOWFLAKE_PRIVATE_KEY_PEM"] = base64.b64decode(b64_key).decode("utf-8")
 
+    # Keep dbt's incremental window in lockstep with the extract window: a widened lookback
+    # (for self-healing) must not leave freshly-extracted rows unmerged.
+    lookback_days = int(os.getenv("AS_RESPONSE_LOOKBACK_DAYS", "25"))
     cmd = [
         dbt_exe, "build",
         "--select", "stg_as_response", "fct_as_response",
         "--project-dir", str(DBT_DIR),
         "--profiles-dir", str(DBT_DIR),
+        "--vars", f'{{"as_response_lookback_days": {lookback_days}}}',
     ]
     print(f"Running dbt: {' '.join(cmd)}")
     # check=True -> a failing model or test aborts the pipeline with a non-zero exit.
@@ -163,7 +168,12 @@ def main() -> str:
     load_dotenv()
     load_dotenv(REPO_ROOT / ".env.test", override=False)
 
-    lookback_days = int(os.getenv("AS_RESPONSE_LOOKBACK_DAYS", "15"))
+    # Widened from 15 -> 25 days for self-healing: with no index the scan cost is identical
+    # (full scan either way), so the extra overlap only adds a little transfer/merge but gives
+    # any row a NOLOCK read missed many more chances to be re-pulled on a later run. The MERGE
+    # is idempotent, so the extra overlap can never duplicate. dbt's window is kept in sync
+    # via --vars in run_dbt().
+    lookback_days = int(os.getenv("AS_RESPONSE_LOOKBACK_DAYS", "25"))
     landing_root = Path(os.getenv("LANDING_DIR", "./landing"))
     # Must match the dbt source (ciena_pcc_raw.RAW_AS_RESPONSE_C in sources.yml).
     raw_table = os.getenv("RAW_AS_RESPONSE_TABLE", "CIENA.PCC.RAW_AS_RESPONSE_C")
@@ -171,6 +181,17 @@ def main() -> str:
     # otherwise a fresh timestamped folder is used.
     run_id = os.getenv("EXTRACT_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
     output_folder = landing_root / "ciena" / "as_response" / f"run_id={run_id}"
+
+    # Disk hygiene: each run writes ~GBs of parquet, so leftover folders from prior runs
+    # (especially failed ones, which don't reach the post-load cleanup) will fill a small VM
+    # disk over weeks. Before writing anything, remove every sibling run folder except this
+    # run's own (which may be a resume target via EXTRACT_RUN_ID). Successful runs also
+    # self-clean after the load below.
+    runs_parent = output_folder.parent
+    if runs_parent.exists():
+        for d in runs_parent.iterdir():
+            if d.is_dir() and d != output_folder:
+                shutil.rmtree(d, ignore_errors=True)
 
     # Resolve the 15-day window start FROM THE SERVER (getdate()), exactly like Matillion,
     # so the two jobs cover the same window regardless of client timezone. Override with
@@ -192,6 +213,27 @@ def main() -> str:
         f"in ~{n_chunks} chunk(s) -> {output_folder}"
     )
 
+    # STREAMING load: prepare the raw table ONCE, then load+delete each chunk as it is
+    # extracted (via the chunk_sink below). This keeps at most ~one chunk of Parquet on the VM
+    # disk at a time, so a wide window (e.g. a 90-day backfill) can't exhaust the small OS disk.
+    # Truncate only on a FRESH run -- a resume (EXTRACT_RUN_ID) must keep already-loaded chunks.
+    manifest_path = output_folder / "_manifest.json"
+    is_resume = manifest_path.exists()
+    print(
+        f"Preparing {raw_table} for streaming load "
+        f"({'RESUME -- no truncate' if is_resume else 'fresh -- truncate'})."
+    )
+    prepare_raw_table(
+        target_table=raw_table,
+        create_table_sql=build_create_table_sql(raw_table),
+        truncate=not is_resume,
+    )
+
+    def _chunk_sink(files: list[str]) -> None:
+        # Append this chunk to the already-prepared raw table; the extractor deletes the
+        # local files right after this returns.
+        load_parquet_files_append(files, target_table=raw_table)
+
     rows = extract_chunked_to_parquet(
         build_chunk_query=lambda lo, hi: build_chunk_query(lo, hi, window_start),
         output_path=str(output_folder),
@@ -200,35 +242,49 @@ def main() -> str:
         n_chunks=n_chunks,
         chunksize=100_000,   # fewer round-trips over the fragile link than 5,000
         max_retries=5,
+        chunk_sink=_chunk_sink,
     )
-    print(f"Extract complete: {rows:,} rows")
+    print(f"Extract + streaming load complete: {rows:,} rows into {raw_table}")
 
     if rows == 0:
-        print("No rows extracted; skipping Snowflake load and dbt.")
+        print("No rows extracted; skipping dbt.")
         return (
             f"No rows extracted for revision_date >= {window_start}. "
-            "Snowflake load and dbt were skipped."
+            f"{raw_table} was truncated to empty and dbt was skipped."
         )
 
-    print(f"Loading Parquet files to Snowflake table {raw_table} (truncate + load)...")
-    # create_table_sql -> bootstrap the table on first run (no-op afterwards).
-    # truncate_target=True -> raw table holds exactly this pull, so the dbt MERGE
-    # downstream never sees duplicate assess_response_id rows.
-    load_parquet_folder_to_table(
-        str(output_folder),
-        target_table=raw_table,
-        truncate_target=True,
-        create_table_sql=build_create_table_sql(raw_table),
-    )
-    print("Snowflake load complete.")
+    # All chunks have already been streamed to Snowflake and their local Parquet deleted.
+    # Remove the (now effectively empty) run folder/manifest unless KEEP_LANDING is set.
+    if os.getenv("KEEP_LANDING", "").lower() not in ("1", "true", "yes"):
+        shutil.rmtree(output_folder, ignore_errors=True)
+        print(f"Cleaned up landing folder: {output_folder}")
 
     # Chain the transform: raw -> staging -> incremental merge into history.
     run_dbt()
     print("Pipeline complete.")
 
+    # Reconcile: raw-vs-final per-day + load integrity, written to an AUDIT table with a Teams
+    # alert on real drift. Wrapped so a reconciliation error never fails an otherwise-good run
+    # (the data is already loaded); you'd just re-run, which is safe (idempotent).
+    final_table = os.getenv("FINAL_AS_RESPONSE_TABLE", '"as_response"')
+    tolerance = int(os.getenv("RECON_TOLERANCE", "0"))
+    try:
+        _, recon_summary = reconcile_run(
+            run_id=run_id,
+            window_start=window_start,
+            extracted_rows=rows,
+            raw_table=raw_table,
+            final_table=final_table,
+            tolerance=tolerance,
+        )
+    except Exception as exc:   # noqa: BLE001 -- reconciliation must never fail the load
+        recon_summary = f"Reconciliation check errored (non-fatal): {exc}"
+    print(recon_summary)
+
     return (
         f"Extracted {rows:,} rows for cast(revision_date as date) >= {window_start}.\n"
-        f"Loaded into {raw_table} and ran dbt build (stg_as_response, fct_as_response)."
+        f"Loaded into {raw_table} and ran dbt build (stg_as_response, fct_as_response).\n"
+        f"{recon_summary}"
     )
 
 

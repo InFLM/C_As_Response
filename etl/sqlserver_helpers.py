@@ -184,8 +184,17 @@ def extract_chunked_to_parquet(
     max_retries: int = 5,
     retry_backoff_seconds: float = 10.0,
     resume: bool = True,
+    chunk_sink=None,
 ) -> int:
     """Extract a revision_date window in resumable chunks along the clustered assess_id key.
+
+    chunk_sink: optional callable(list_of_parquet_paths) invoked after each chunk is written.
+        When provided, the pipeline STREAMS: each chunk's Parquet is handed to the sink (e.g.
+        loaded to Snowflake) and then DELETED locally before the next chunk starts, so peak
+        disk usage is ~one chunk instead of the whole window. The sink runs inside the chunk's
+        retry/manifest guard, so a chunk is marked complete only after it both extracted AND
+        sank successfully; a crash in between re-does the chunk on resume (safe/idempotent).
+        When None, every chunk's Parquet is kept on disk (original behavior).
 
     Why (vs. single-pass extract_query_to_parquet): the source is a log-shipping standby that
     drops every session each time it restores a log, so one long full scan reliably gets
@@ -244,6 +253,7 @@ def extract_chunked_to_parquet(
                 os.remove(f)
             try:
                 rows_this = 0
+                chunk_files: list[str] = []
                 with connect_sqlserver() as conn:
                     for j, chunk in enumerate(
                         pd.read_sql(build_chunk_query(clo, chi), conn, chunksize=chunksize),
@@ -251,7 +261,18 @@ def extract_chunked_to_parquet(
                     ):
                         fp = os.path.join(output_path, f"part-{clo}-{chi}-{j:03d}.parquet")
                         chunk.to_parquet(fp, index=False, engine="pyarrow")
+                        chunk_files.append(fp)
                         rows_this += len(chunk)
+                # Stream this chunk to its destination and free the disk before the next chunk,
+                # so peak local usage stays at ~one chunk. Done INSIDE the try so a sink failure
+                # leaves the chunk un-marked and it re-runs on retry/resume (idempotent).
+                if chunk_sink is not None:
+                    chunk_sink(chunk_files)
+                    for fp in chunk_files:
+                        try:
+                            os.remove(fp)
+                        except OSError:
+                            pass
                 completed[key] = rows_this
                 total_rows += rows_this
                 _save_manifest()
